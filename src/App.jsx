@@ -273,26 +273,8 @@ function drawStickyOnCanvas(ctx, el) {
     ctx.fill();
   });
 
-  // Text content
-  if (el.text) {
-    ctx.fillStyle = sc.text;
-    ctx.font = "13px 'DM Sans', sans-serif";
-    ctx.textBaseline = "top";
-    ctx.textAlign = "left";
-    const pad = 10;
-    const maxW = w - pad * 2;
-    const rawLines = el.text.split("\n");
-    const allLines = [];
-    rawLines.forEach(rl => {
-      const wrapped = wrapText(ctx, rl || " ", maxW);
-      allLines.push(...wrapped);
-    });
-    const lineH = 19;
-    allLines.forEach((line, i) => {
-      const ly = y + 34 + i * lineH;
-      if (ly + lineH < y + h - 4) ctx.fillText(line, x + pad, ly);
-    });
-  }
+  // Text is rendered by the DOM <textarea> overlay, not the canvas,
+  // to avoid blurry sub-pixel font rendering on scaled (HiDPI) canvases.
 
   ctx.restore();
 }
@@ -585,7 +567,7 @@ function PropertiesSidebar({ element, onUpdate }) {
 // MAIN COMPONENT
 // ═══════════════════════════════════════════════════════════════════
 
-export default function App() {
+export default function Whiteboard() {
   const canvasRef  = useRef(null);
   const wrapperRef = useRef(null);
 
