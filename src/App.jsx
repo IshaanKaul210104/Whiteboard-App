@@ -1,6 +1,28 @@
 import { useState, useRef, useEffect, useCallback, useReducer } from "react";
 
 // ═══════════════════════════════════════════════════════════════════
+// WEBSOCKET CONFIG
+// ═══════════════════════════════════════════════════════════════════
+
+const ROOM_ID    = "default-room";
+const WS_URL     = (uid) => `ws://localhost:8000/ws/${ROOM_ID}/${uid}`;
+
+// Stable per-tab ephemeral user ID
+const MY_USER_ID = `user_${Math.random().toString(36).slice(2, 8)}`;
+
+// Deterministic cursor colour per remote user
+const CURSOR_COLORS = [
+  "#f43f5e","#f97316","#eab308","#22c55e",
+  "#06b6d4","#8b5cf6","#ec4899","#14b8a6",
+];
+const _colorCache = {};
+let   _colorIdx   = 0;
+function colorForUser(uid) {
+  if (!_colorCache[uid]) _colorCache[uid] = CURSOR_COLORS[_colorIdx++ % CURSOR_COLORS.length];
+  return _colorCache[uid];
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════
 
@@ -340,6 +362,21 @@ function elementsReducer(state, action) {
     case "DEL_SEL":  return state.filter(el => !el.isSelected);
     case "UNDO":     return state.slice(0, -1);
     case "CLEAR":    return [];
+    // ── Remote actions (WebSocket) ──────────────────────────────────
+    // REMOTE_ADD: add if not already present (idempotent)
+    case "REMOTE_ADD": {
+      const exists = state.some(el => el.id === action.element.id);
+      return exists ? state : [...state, { ...action.element, isSelected: false }];
+    }
+    // REMOTE_UPDATE: merge patch, but only if caller says we're allowed
+    // (caller checks the drag-lock before dispatching)
+    case "REMOTE_UPDATE":
+      return state.map(el =>
+        el.id === action.id ? { ...el, ...action.patch, isSelected: el.isSelected } : el
+      );
+    // REMOTE_DELETE: remove by id
+    case "REMOTE_DELETE":
+      return state.filter(el => el.id !== action.id);
     default:         return state;
   }
 }
@@ -563,6 +600,62 @@ function PropertiesSidebar({ element, onUpdate }) {
   );
 }
 
+// ─── Remote Cursor Overlay ────────────────────────────────────────
+function RemoteCursor({ userId, x, y }) {
+  const color = colorForUser(userId);
+  const label = `Guest ${userId.slice(-4)}`;
+  return (
+    <div
+      style={{
+        position: "absolute",
+        left: x, top: y,
+        pointerEvents: "none",
+        zIndex: 50,
+        transform: "translate(0, 0)",
+        transition: "left 60ms linear, top 60ms linear",
+      }}
+    >
+      {/* SVG cursor */}
+      <svg width="20" height="20" viewBox="0 0 24 24" style={{ filter: `drop-shadow(0 1px 2px rgba(0,0,0,0.3))` }}>
+        <path d="M5 3l14 9-7 1-4 7L5 3z" fill={color} stroke="white" strokeWidth="1.5" strokeLinejoin="round"/>
+      </svg>
+      {/* Name tag */}
+      <div style={{
+        position: "absolute",
+        left: 18, top: 2,
+        backgroundColor: color,
+        color: "#fff",
+        fontSize: 11,
+        fontWeight: 600,
+        fontFamily: "'DM Sans', sans-serif",
+        padding: "2px 7px",
+        borderRadius: 20,
+        whiteSpace: "nowrap",
+        boxShadow: "0 1px 4px rgba(0,0,0,0.2)",
+        letterSpacing: "0.02em",
+      }}>
+        {label}
+      </div>
+    </div>
+  );
+}
+
+// ─── Connection Status Badge ──────────────────────────────────────
+function ConnectionBadge({ status, peerCount }) {
+  const cfg = {
+    connected:    { dot: "bg-emerald-400", text: "text-emerald-600", label: `Connected · ${peerCount} peer${peerCount !== 1 ? "s" : ""}` },
+    connecting:   { dot: "bg-amber-400 animate-pulse", text: "text-amber-600", label: "Connecting…" },
+    disconnected: { dot: "bg-rose-400", text: "text-rose-500", label: "Disconnected — retrying" },
+  }[status] || { dot: "bg-slate-300", text: "text-slate-400", label: status };
+
+  return (
+    <div className="flex items-center gap-1.5">
+      <div className={`w-2 h-2 rounded-full ${cfg.dot}`} />
+      <span className={`text-xs font-medium ${cfg.text}`}>{cfg.label}</span>
+    </div>
+  );
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // MAIN COMPONENT
 // ═══════════════════════════════════════════════════════════════════
@@ -578,6 +671,15 @@ export default function Whiteboard() {
   const [stickyCol,    setStickyCol]    = useState(STICKY_COLORS[0]);
   const [showSizeMenu, setShowSizeMenu] = useState(false);
 
+  // ── WebSocket state ──────────────────────────────────────────────
+  const [wsStatus,   setWsStatus]   = useState("connecting"); // connecting | connected | disconnected
+  const [peerCount,  setPeerCount]  = useState(0);
+  const [otherCursors, setOtherCursors] = useState({}); // { userId: { x, y } }
+
+  const wsRef            = useRef(null);
+  const reconnectTimer   = useRef(null);
+  const mouseMoveTimer   = useRef(null); // throttle ref for MOUSE_MOVE
+
   // In-flight drawing state (refs to avoid stale closures in canvas callbacks)
   const isDrawingRef  = useRef(false);
   const activeRef     = useRef(null);
@@ -591,6 +693,118 @@ export default function Whiteboard() {
   const toolRef = useRef(tool);     useEffect(() => { toolRef.current = tool; }, [tool]);
   const colRef  = useRef(color);    useEffect(() => { colRef.current = color; }, [color]);
   const swRef   = useRef(sw);       useEffect(() => { swRef.current = sw; }, [sw]);
+
+  // ── WebSocket helpers ────────────────────────────────────────────
+
+  const wsSend = useCallback((type, payload) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type, userId: MY_USER_ID, payload }));
+    }
+  }, []);
+
+  // ── WebSocket connection + auto-reconnect ─────────────────────────
+  useEffect(() => {
+    let active = true;
+
+    function connect() {
+      if (!active) return;
+      setWsStatus("connecting");
+      const ws = new WebSocket(WS_URL(MY_USER_ID));
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        if (!active) return;
+        setWsStatus("connected");
+      };
+
+      ws.onmessage = (evt) => {
+        if (!active) return;
+        let msg;
+        try { msg = JSON.parse(evt.data); } catch { return; }
+
+        const { type, userId, payload } = msg;
+
+        switch (type) {
+
+          // Server sends this on connect — tells us who is already here
+          case "ROOM_INFO":
+            setPeerCount(payload.peers.length);
+            break;
+
+          // Another user drew / moved / deleted a shape
+          case "DRAWING_UPDATE": {
+            const { action, element } = payload;
+
+            if (action === "ADD") {
+              dispatch({ type: "REMOTE_ADD", element });
+            }
+
+            if (action === "UPDATE") {
+              // Conflict prevention: if WE are currently dragging this exact element,
+              // ignore the remote update so our local drag stays smooth.
+              const iAmDragging =
+                isDraggingRef.current && selectedIdRef.current === element.id;
+              if (!iAmDragging) {
+                dispatch({ type: "REMOTE_UPDATE", id: element.id, patch: element });
+              }
+            }
+
+            if (action === "DELETE") {
+              dispatch({ type: "REMOTE_DELETE", id: element.id });
+            }
+            break;
+          }
+
+          // Remote cursor movement
+          case "MOUSE_MOVE":
+            setOtherCursors(prev => ({
+              ...prev,
+              [userId]: { x: payload.x, y: payload.y },
+            }));
+            break;
+
+          // Remote board wipe
+          case "CLEAR_CANVAS":
+            dispatch({ type: "CLEAR" });
+            break;
+
+          // Peer disconnected — remove their cursor
+          case "USER_LEFT":
+            setOtherCursors(prev => {
+              const next = { ...prev };
+              delete next[payload.userId];
+              return next;
+            });
+            setPeerCount(c => Math.max(0, c - 1));
+            break;
+
+          default:
+            break;
+        }
+      };
+
+      ws.onclose = () => {
+        if (!active) return;
+        setWsStatus("disconnected");
+        // Auto-reconnect after 2 s
+        reconnectTimer.current = setTimeout(connect, 2000);
+      };
+
+      ws.onerror = () => {
+        ws.close(); // triggers onclose → reconnect
+      };
+    }
+
+    connect();
+
+    return () => {
+      active = false;
+      clearTimeout(reconnectTimer.current);
+      clearTimeout(mouseMoveTimer.current);
+      wsRef.current?.close();
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Derived: the currently selected shape element (for Properties panel)
   const selectedShape = elements.find(el =>
@@ -646,19 +860,22 @@ export default function Whiteboard() {
     const el = elsRef.current.find(el => el.id === id);
     if (!el) return;
     isDraggingRef.current = true;
+    selectedIdRef.current = id;
     dragOffRef.current = { dx: e.clientX - el.x, dy: e.clientY - el.y };
-    const move = me => dispatch({
-      type: "UPDATE", id,
-      patch: { x: me.clientX - dragOffRef.current.dx, y: me.clientY - dragOffRef.current.dy }
-    });
+    const move = me => {
+      const patch = { x: me.clientX - dragOffRef.current.dx, y: me.clientY - dragOffRef.current.dy };
+      dispatch({ type: "UPDATE", id, patch });
+      wsSend("DRAWING_UPDATE", { action: "UPDATE", element: { ...elsRef.current.find(el => el.id === id), ...patch } });
+    };
     const up = () => {
       isDraggingRef.current = false;
+      selectedIdRef.current = null;
       window.removeEventListener("mousemove", move);
       window.removeEventListener("mouseup", up);
     };
     window.addEventListener("mousemove", move);
     window.addEventListener("mouseup", up);
-  }, []);
+  }, [wsSend]);
 
   // ── Mouse down ───────────────────────────────────────────────────
   const onDown = useCallback(e => {
@@ -696,16 +913,15 @@ export default function Whiteboard() {
       return;
     }
 
-    // STICKY — place a note centered on click
+    // STICKY — place a note centered on click, immediately broadcast ADD
     if (t === TOOLS.STICKY) {
-      dispatch({
-        type: "ADD",
-        element: {
-          id: uid(), type: TOOLS.STICKY,
-          x: x - 110, y: y - 110, width: 220, height: 220,
-          text: "", stickyBg: stickyCol.bg, color: "#374151", isSelected: false,
-        },
-      });
+      const element = {
+        id: uid(), type: TOOLS.STICKY,
+        x: x - 110, y: y - 110, width: 220, height: 220,
+        text: "", stickyBg: stickyCol.bg, color: "#374151", isSelected: false,
+      };
+      dispatch({ type: "ADD", element });
+      wsSend("DRAWING_UPDATE", { action: "ADD", element });
       return;
     }
 
@@ -717,11 +933,11 @@ export default function Whiteboard() {
         x, y, width: 0, height: 0,
         _ox: x, _oy: y,
         color: colRef.current, strokeWidth: swRef.current,
-        label: "",      // label field initialized empty
+        label: "",
         isSelected: false,
       };
     }
-  }, [stickyCol]);
+  }, [stickyCol, wsSend]);
 
   // ── Mouse move ───────────────────────────────────────────────────
   const onMove = useCallback(e => {
@@ -730,28 +946,34 @@ export default function Whiteboard() {
     const ctx = canvas.getContext("2d");
     const t = toolRef.current;
 
+    // Throttled cursor broadcast — max 1 message per 50 ms
+    if (!mouseMoveTimer.current) {
+      mouseMoveTimer.current = setTimeout(() => {
+        wsSend("MOUSE_MOVE", { x, y });
+        mouseMoveTimer.current = null;
+      }, 50);
+    }
+
     // Drag selected canvas element
     if (isDraggingRef.current && selectedIdRef.current && t === TOOLS.SELECT) {
       const el = elsRef.current.find(el => el.id === selectedIdRef.current);
       if (!el || el.type === TOOLS.STICKY) return;
+      let patch;
       if (el.type === TOOLS.PEN) {
         const dx = x - dragOffRef.current.dx - el.x;
         const dy = y - dragOffRef.current.dy - el.y;
-        dispatch({
-          type: "UPDATE", id: el.id,
-          patch: {
-            x: x - dragOffRef.current.dx,
-            y: y - dragOffRef.current.dy,
-            points: el.points.map(p => ({ x: p.x + dx, y: p.y + dy })),
-          },
-        });
+        patch = {
+          x: x - dragOffRef.current.dx,
+          y: y - dragOffRef.current.dy,
+          points: el.points.map(p => ({ x: p.x + dx, y: p.y + dy })),
+        };
         dragOffRef.current = { dx: x - el.x, dy: y - el.y };
       } else {
-        dispatch({
-          type: "UPDATE", id: el.id,
-          patch: { x: x - dragOffRef.current.dx, y: y - dragOffRef.current.dy },
-        });
+        patch = { x: x - dragOffRef.current.dx, y: y - dragOffRef.current.dy };
       }
+      dispatch({ type: "UPDATE", id: el.id, patch });
+      // Broadcast live drag so other users see it moving in real time
+      wsSend("DRAWING_UPDATE", { action: "UPDATE", element: { ...el, ...patch } });
       return;
     }
 
@@ -769,23 +991,27 @@ export default function Whiteboard() {
       ghostRef.current = el;
       renderAll(ctx, elsRef.current, el);
     }
-  }, []);
+  }, [wsSend]);
 
   // ── Mouse up ─────────────────────────────────────────────────────
   const onUp = useCallback(() => {
     if (isDraggingRef.current && toolRef.current === TOOLS.SELECT) {
       isDraggingRef.current = false;
+      selectedIdRef.current = null;
       return;
     }
     if (!isDrawingRef.current || !activeRef.current) return;
     const el = activeRef.current;
     const { _ox, _oy, ...committed } = el;
     const ok = el.type === TOOLS.PEN ? el.points.length > 2 : el.width > 5 && el.height > 5;
-    if (ok) dispatch({ type: "ADD", element: committed });
+    if (ok) {
+      dispatch({ type: "ADD", element: committed });
+      wsSend("DRAWING_UPDATE", { action: "ADD", element: committed });
+    }
     ghostRef.current = null;
     activeRef.current = null;
     isDrawingRef.current = false;
-  }, []);
+  }, [wsSend]);
 
   const cursorMap = {
     [TOOLS.SELECT]: "cursor-default",
@@ -827,6 +1053,13 @@ export default function Whiteboard() {
         />
       </div>
 
+      {/* ── Remote Cursor Overlays ── */}
+      <div className="absolute inset-0 pointer-events-none">
+        {Object.entries(otherCursors).map(([userId, pos]) => (
+          <RemoteCursor key={userId} userId={userId} x={pos.x} y={pos.y} />
+        ))}
+      </div>
+
       {/* ── Sticky Note DOM Overlays ── */}
       {/* Positioned on top of canvas; textarea is transparent so canvas note body shows through */}
       <div className="absolute inset-0 pointer-events-none">
@@ -836,7 +1069,11 @@ export default function Whiteboard() {
               el={el}
               isSelected={el.isSelected}
               onSelect={id => dispatch({ type: "SELECT", id })}
-              onUpdate={(id, patch) => dispatch({ type: "UPDATE", id, patch })}
+              onUpdate={(id, patch) => {
+                dispatch({ type: "UPDATE", id, patch });
+                const full = elsRef.current.find(e => e.id === id);
+                if (full) wsSend("DRAWING_UPDATE", { action: "UPDATE", element: { ...full, ...patch } });
+              }}
               onDragStart={handleStickyDragStart}
             />
           </div>
@@ -848,19 +1085,26 @@ export default function Whiteboard() {
       {tool === TOOLS.SELECT && selectedShape && (
         <PropertiesSidebar
           element={selectedShape}
-          onUpdate={(id, patch) => dispatch({ type: "UPDATE", id, patch })}
+          onUpdate={(id, patch) => {
+            dispatch({ type: "UPDATE", id, patch });
+            const el = elsRef.current.find(e => e.id === id);
+            if (el) wsSend("DRAWING_UPDATE", { action: "UPDATE", element: { ...el, ...patch } });
+          }}
         />
       )}
 
       {/* ── Status badge ── */}
-      <div className="absolute top-4 left-1/2 -translate-x-1/2 z-40 flex items-center gap-2 px-4 py-1.5 rounded-full bg-white/90 backdrop-blur-sm border border-slate-200 shadow-sm">
-        <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+      <div className="absolute top-4 left-1/2 -translate-x-1/2 z-40 flex items-center gap-3 px-4 py-1.5 rounded-full bg-white/90 backdrop-blur-sm border border-slate-200 shadow-sm">
+        <ConnectionBadge status={wsStatus} peerCount={peerCount} />
+        <div className="w-px h-3.5 bg-slate-200" />
         <span className="text-xs font-medium text-slate-500 tracking-wide">
-          Whiteboard · {elements.length} object{elements.length !== 1 ? "s" : ""}
+          {elements.length} object{elements.length !== 1 ? "s" : ""}
         </span>
         {selectedCount > 0 && (
           <span className="text-xs text-indigo-500 font-semibold">· {selectedCount} selected</span>
         )}
+        <div className="w-px h-3.5 bg-slate-200" />
+        <span className="text-xs text-slate-400 font-mono">#{MY_USER_ID.slice(-6)}</span>
       </div>
 
       {/* ── Keyboard hints ── */}
@@ -963,7 +1207,7 @@ export default function Whiteboard() {
           <Icons.Undo />
         </ToolBtn>
         <button
-          onClick={() => dispatch({ type: "CLEAR" })}
+          onClick={() => { dispatch({ type: "CLEAR" }); wsSend("CLEAR_CANVAS", {}); }}
           title="Clear board — removes all shapes, sticky notes and labels"
           className="flex items-center gap-1.5 px-2.5 h-9 rounded-xl text-xs font-semibold text-rose-400 hover:bg-rose-50 hover:text-rose-600 transition-colors shrink-0"
         >
