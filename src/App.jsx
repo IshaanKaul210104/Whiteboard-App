@@ -643,7 +643,7 @@ function RemoteCursor({ userId, x, y }) {
 // ─── Connection Status Badge ──────────────────────────────────────
 function ConnectionBadge({ status, peerCount }) {
   const cfg = {
-    connected:    { dot: "bg-emerald-400", text: "text-emerald-600", label: `Connected · ${peerCount} peer${peerCount !== 1 ? "s" : ""}` },
+    connected:    { dot: "bg-emerald-400", text: "text-emerald-600", label: `${peerCount} User${peerCount !== 1 ? "s" : ""} Online` },
     connecting:   { dot: "bg-amber-400 animate-pulse", text: "text-amber-600", label: "Connecting…" },
     disconnected: { dot: "bg-rose-400", text: "text-rose-500", label: "Disconnected — retrying" },
   }[status] || { dot: "bg-slate-300", text: "text-slate-400", label: status };
@@ -727,34 +727,34 @@ export default function Whiteboard() {
 
         switch (type) {
 
-          // Server sends this on connect — tells us who is already here
-          case "ROOM_INFO":
-            setPeerCount(payload.peers.length);
+          // Server sends full persisted board on connect — replace local state
+          case "INITIAL_STATE":
+            dispatch({ type: "CLEAR" });
+            (payload.elements || []).forEach(el =>
+              dispatch({ type: "REMOTE_ADD", element: el })
+            );
             break;
 
-          // Another user drew / moved / deleted a shape
+          // Another user drew or moved a shape
           case "DRAWING_UPDATE": {
             const { action, element } = payload;
-
             if (action === "ADD") {
               dispatch({ type: "REMOTE_ADD", element });
             }
-
             if (action === "UPDATE") {
-              // Conflict prevention: if WE are currently dragging this exact element,
-              // ignore the remote update so our local drag stays smooth.
               const iAmDragging =
                 isDraggingRef.current && selectedIdRef.current === element.id;
               if (!iAmDragging) {
                 dispatch({ type: "REMOTE_UPDATE", id: element.id, patch: element });
               }
             }
-
-            if (action === "DELETE") {
-              dispatch({ type: "REMOTE_DELETE", id: element.id });
-            }
             break;
           }
+
+          // Another user deleted an element
+          case "DELETE_ELEMENT":
+            dispatch({ type: "REMOTE_DELETE", id: payload.id });
+            break;
 
           // Remote cursor movement
           case "MOUSE_MOVE":
@@ -769,6 +769,11 @@ export default function Whiteboard() {
             dispatch({ type: "CLEAR" });
             break;
 
+          // Server broadcasts accurate peer count on every connect/disconnect
+          case "PEER_COUNT_UPDATE":
+            setPeerCount(payload.count);
+            break;
+
           // Peer disconnected — remove their cursor
           case "USER_LEFT":
             setOtherCursors(prev => {
@@ -776,7 +781,6 @@ export default function Whiteboard() {
               delete next[payload.userId];
               return next;
             });
-            setPeerCount(c => Math.max(0, c - 1));
             break;
 
           default:
@@ -843,7 +847,12 @@ export default function Whiteboard() {
     const kd = e => {
       const tag = document.activeElement?.tagName;
       if (tag === "TEXTAREA" || tag === "INPUT") return;
-      if (e.key === "Delete" || e.key === "Backspace") dispatch({ type: "DEL_SEL" });
+      if (e.key === "Delete" || e.key === "Backspace") {
+        elsRef.current.filter(el => el.isSelected).forEach(el => {
+          wsSend("DELETE_ELEMENT", { id: el.id });
+        });
+        dispatch({ type: "DEL_SEL" });
+      }
       if ((e.metaKey || e.ctrlKey) && e.key === "z") dispatch({ type: "UNDO" });
       if (e.key === "Escape") dispatch({ type: "DESELECT" });
       if (e.key === "v") setTool(TOOLS.SELECT);
@@ -1199,7 +1208,12 @@ export default function Whiteboard() {
 
         {/* Action buttons */}
         {selectedCount > 0 && (
-          <ToolBtn onClick={() => dispatch({ type: "DEL_SEL" })} title="Delete selected  [Del]" danger>
+          <ToolBtn onClick={() => {
+            elsRef.current.filter(el => el.isSelected).forEach(el => {
+              wsSend("DELETE_ELEMENT", { id: el.id });
+            });
+            dispatch({ type: "DEL_SEL" });
+          }} title="Delete selected  [Del]" danger>
             <Icons.Delete />
           </ToolBtn>
         )}
